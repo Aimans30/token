@@ -1,7 +1,12 @@
-# aiman_api_min.py
-# -------------------------------------------------------------------------
-# SAFE VERSION - ALL SECRETS LOADED FROM ENVIRONMENT VARIABLES
-# -------------------------------------------------------------------------
+"""
+Final env-based Zerodha token refresher script.
+
+- Loads all secrets from environment variables.
+- Logs into Zerodha using Selenium + TOTP.
+- Gets KiteConnect access_token.
+- Updates MongoDB collection `zerodhatokens`.
+- Works locally and in GitHub Actions (headless Chromium).
+"""
 
 import os
 import logging
@@ -27,28 +32,33 @@ from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 # -------------------------------------------------------------------------
-# LOAD SECRETS FROM ENV VARIABLES
-# (Set these in GitHub Actions or .env locally)
+# ENV VARIABLES (SET THESE IN GITHUB SECRETS OR LOCAL .env)
 # -------------------------------------------------------------------------
 
-USR1_ZERODHA_USER_ID = os.getenv("ZERODHA_USER_ID")
-USR1_ZERODHA_PASSWORD = os.getenv("ZERODHA_PASSWORD")
-USR1_ZERODHA_API_KEY = os.getenv("ZERODHA_API_KEY")
-USR1_ZERODHA_API_SECRET = os.getenv("ZERODHA_API_SECRET")
-USR1_ZERODHA_AUTHENTICATOR = os.getenv("ZERODHA_TOTP_SECRET")
+# Load .env locally if present (has no effect in GitHub Actions unless you add a file)
+project_root = Path(__file__).parent
+dotenv_path = project_root / ".env"
+if dotenv_path.is_file():
+    load_dotenv(dotenv_path=dotenv_path, override=True)
+
+ZERODHA_USER_ID = os.getenv("ZERODHA_USER_ID")
+ZERODHA_PASSWORD = os.getenv("ZERODHA_PASSWORD")
+ZERODHA_API_KEY = os.getenv("ZERODHA_API_KEY")
+ZERODHA_API_SECRET = os.getenv("ZERODHA_API_SECRET")
+ZERODHA_TOTP_SECRET = os.getenv("ZERODHA_TOTP_SECRET")
 
 MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB_NAME = ""   # default empty if not set
+# DB name is already in URI, so leave this empty
+MONGO_DB_NAME = ""
 MONGO_COLLECTION_NAME = "zerodhatokens"
 TOKEN_UPDATED_BY = "aiman.singh30@gmail.com"
 
-# Validate required env vars
 required_env = {
-    "ZERODHA_USER_ID": USR1_ZERODHA_USER_ID,
-    "ZERODHA_PASSWORD": USR1_ZERODHA_PASSWORD,
-    "ZERODHA_API_KEY": USR1_ZERODHA_API_KEY,
-    "ZERODHA_API_SECRET": USR1_ZERODHA_API_SECRET,
-    "ZERODHA_TOTP_SECRET": USR1_ZERODHA_AUTHENTICATOR,
+    "ZERODHA_USER_ID": ZERODHA_USER_ID,
+    "ZERODHA_PASSWORD": ZERODHA_PASSWORD,
+    "ZERODHA_API_KEY": ZERODHA_API_KEY,
+    "ZERODHA_API_SECRET": ZERODHA_API_SECRET,
+    "ZERODHA_TOTP_SECRET": ZERODHA_TOTP_SECRET,
     "MONGO_URI": MONGO_URI,
 }
 missing = [k for k, v in required_env.items() if not v]
@@ -116,29 +126,24 @@ def load_app_config() -> dict:
         logging.error(f"Error loading app_config.yaml: {e}")
         raise
 
+
 APP_CONFIG = load_app_config()
 
 # -------------------------------------------------------------------------
-# LOAD CREDENTIALS CLEANLY (NO EMBEDDED SECRETS)
+# CREDENTIAL LOADER (NOW ONLY FROM ENV)
 # -------------------------------------------------------------------------
 
-def load_config(user_key="USR1_"):
+def load_config():
     """
-    Now loads only from environment variables (no fallback secrets).
+    Loads Zerodha credentials from env vars.
     """
-    ZERODHA_SECRETS = {
-        "api_key": USR1_ZERODHA_API_KEY,
-        "api_secret": USR1_ZERODHA_API_SECRET,
-        "usr": USR1_ZERODHA_USER_ID,
-        "pwd": USR1_ZERODHA_PASSWORD,
-        "authenticator": USR1_ZERODHA_AUTHENTICATOR,
+    return {
+        "api_key": ZERODHA_API_KEY,
+        "api_secret": ZERODHA_API_SECRET,
+        "usr": ZERODHA_USER_ID,
+        "pwd": ZERODHA_PASSWORD,
+        "authenticator": ZERODHA_TOTP_SECRET,
     }
-
-    for k, v in ZERODHA_SECRETS.items():
-        if not v:
-            raise ValueError(f"Missing env variable for: {k}")
-
-    return ZERODHA_SECRETS
 
 # -------------------------------------------------------------------------
 # MONGO HELPER
@@ -146,15 +151,20 @@ def load_config(user_key="USR1_"):
 
 def save_token_to_mongo(access_token: str):
     """
-    Upserts token into zerodhatokens collection.
+    Upserts the token document in collection `zerodhatokens`.
+    Matches document by `updatedBy = TOKEN_UPDATED_BY`.
     """
+    client = MongoClient(MONGO_URI)
     try:
-        client = MongoClient(MONGO_URI)
-        db = client[MONGO_DB_NAME] if MONGO_DB_NAME else client.get_default_database()
+        if MONGO_DB_NAME:
+            db = client[MONGO_DB_NAME]
+        else:
+            db = client.get_default_database()
+
         coll = db[MONGO_COLLECTION_NAME]
 
         now = datetime.utcnow()
-        expires_at = now + timedelta(hours=24)
+        expires_at = now + timedelta(hours=24)  # adjust if needed
 
         result = coll.update_one(
             {"updatedBy": TOKEN_UPDATED_BY},
@@ -166,25 +176,31 @@ def save_token_to_mongo(access_token: str):
                     "isActive": True,
                     "updatedBy": TOKEN_UPDATED_BY,
                 },
-                "$setOnInsert": {"createdAt": now},
+                "$setOnInsert": {
+                    "createdAt": now,
+                },
             },
             upsert=True,
         )
 
         logging.info(
-            f"Mongo update: matched={result.matched_count}, modified={result.modified_count}"
+            f"Mongo update: matched={result.matched_count}, modified={result.modified_count}, upserted_id={result.upserted_id}"
         )
 
+    except Exception as e:
+        logging.error(f"Failed to save token to MongoDB: {e}")
+        raise
     finally:
-        client.close()
+        try:
+            client.close()
+        except Exception:
+            pass
 
 # -------------------------------------------------------------------------
-# ZERODHA CLIENT (LOGIN)
+# ZERODHA CLIENT (LOGIN ONLY)
 # -------------------------------------------------------------------------
 
 class ZerodhaClient:
-    _user_map = APP_CONFIG.get("user_credentials_map", {})
-
     def __init__(self, user_id="XW7136"):
         self.user_id = user_id
         self.config = load_config()
@@ -193,79 +209,230 @@ class ZerodhaClient:
 
     @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def login(self):
+        """
+        Automated login to Zerodha using Selenium.
+        Returns (kite, access_token).
+        """
         logging.info("Starting Zerodha login…")
         self.kite = KiteConnect(api_key=self.config["api_key"])
         login_url = self.kite.login_url()
+
+        chrome_driver_path = APP_CONFIG.get("chrome_driver_path") or ""
+        chrome_user_data_dir = APP_CONFIG.get("chrome_user_data_dir") or ""
 
         chrome_options = Options()
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option("useAutomationExtension", False)
 
-        # Headless mode for GitHub Actions
+        # Optional local profile reuse
+        if chrome_user_data_dir and not os.getenv("GITHUB_ACTIONS"):
+            chrome_options.add_argument(f"--user-data-dir={chrome_user_data_dir}")
+            logging.info(f"Using chrome user-data-dir: {chrome_user_data_dir}")
+
+        # Headless + proper flags for GitHub Actions / CI
         if os.getenv("GITHUB_ACTIONS") == "true":
-            chrome_options.binary_location = "/usr/bin/chromium-browser"
+            chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium-browser")
+            chrome_options.binary_location = chrome_bin
             chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--window-size=1920,1080")
+            chrome_options.add_argument("--remote-debugging-port=9222")
 
-        driver_path = ChromeDriverManager().install()
-        driver = webdriver.Chrome(service=Service(driver_path), options=chrome_options)
+        driver = None
+
+        # 1) Try explicit driver path from config (if any)
+        if chrome_driver_path:
+            try:
+                service = Service(chrome_driver_path)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                logging.info("Started Chrome via chrome_driver_path.")
+            except Exception as e:
+                logging.warning(f"Failed with chrome_driver_path: {e}")
+                driver = None
+
+        # 2) Use webdriver-manager to download a matching driver
+        if driver is None:
+            try:
+                logging.info("====== WebDriver manager ======")
+                driver_path = ChromeDriverManager().install()
+                service = Service(driver_path)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                logging.info("Started Chrome via webdriver-manager.")
+            except Exception as e:
+                logging.error(f"webdriver-manager failed: {e}")
+                raise RuntimeError("Unable to start Chrome via webdriver-manager") from e
 
         try:
             driver.get(login_url)
             wait = WebDriverWait(driver, 20)
 
             # User ID
-            user_box = wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//input[@id="userid"]'))
+            user_id_box = wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, '//input[@type="text" or @id="userid" or @name="userid"]')
+                )
             )
-            user_box.send_keys(self.config["usr"])
+            user_id_box.clear()
+            user_id_box.send_keys(self.config["usr"])
 
             # Password
-            pwd_box = wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//input[@id="password"]'))
+            password_box = wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, '//input[@type="password" or @name="password"]')
+                )
             )
-            pwd_box.send_keys(self.config["pwd"])
+            password_box.clear()
+            password_box.send_keys(self.config["pwd"])
 
-            driver.find_element(By.XPATH, '//button[@type="submit"]').click()
+            # Login submit
+            submit_btns = driver.find_elements(By.XPATH, '//button[@type="submit"]')
+            if submit_btns:
+                submit_btns[0].click()
+            else:
+                alt_btns = driver.find_elements(
+                    By.XPATH,
+                    "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login') "
+                    "or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]",
+                )
+                if alt_btns:
+                    alt_btns[0].click()
+                else:
+                    raise Exception("Login submit button not found")
 
+            # Wait for TOTP page
             import time
             time.sleep(2)
 
-            # TOTP
+            # TOTP input
             totp_box = wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//input[@id="totp"]'))
+                EC.element_to_be_clickable(
+                    (By.XPATH, '//input[@type="number" or @name="totp" or @id="totp"]')
+                )
             )
-            otp = pyotp.TOTP(self.config["authenticator"]).now()
-            totp_box.send_keys(otp)
 
-            # Submit OTP
-            time.sleep(1)
-            driver.find_element(By.XPATH, '//button[@type="submit"]').click()
+            # Generate and enter TOTP
+            authkey = pyotp.TOTP(self.config["authenticator"]).now()
+            print(f"Generated TOTP: {authkey}")
 
-            wait.until(EC.url_contains("request_token"))
-            rt = driver.current_url.split("request_token=")[1].split("&")[0]
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    totp_box.clear()
+                    totp_box.send_keys(authkey)
+                    print("TOTP entered successfully")
+                    break
+                except Exception:
+                    if attempt < max_retries - 1:
+                        print(f"Retry {attempt + 1}: re-finding TOTP field")
+                        time.sleep(1)
+                        totp_box = driver.find_element(
+                            By.XPATH,
+                            '//input[@type="number" or @name="totp" or @id="totp"]',
+                        )
+                    else:
+                        raise
+
+            # Submit TOTP (or auto-submit)
+            time.sleep(2)
+            for attempt in range(max_retries):
+                try:
+                    submit_btns = driver.find_elements(
+                        By.XPATH,
+                        '//button[@type="submit"] | '
+                        '//button[contains(text(), "Continue")] | '
+                        '//button[contains(text(), "CONTINUE")]',
+                    )
+
+                    if not submit_btns:
+                        submit_btns = driver.find_elements(
+                            By.XPATH,
+                            "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+                        )
+
+                    if submit_btns:
+                        submit_btns[-1].click()
+                        print("TOTP submit button clicked (Continue)")
+                        break
+                    else:
+                        print("No submit button found, check if auto-submitted")
+                        time.sleep(2)
+                        if (
+                            "request_token" in driver.current_url
+                            or "status=success" in driver.current_url
+                        ):
+                            print("Auto-submitted successfully!")
+                            break
+                        raise Exception("TOTP submit button not found")
+                except Exception:
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                    else:
+                        raise
+
+            # Wait for redirect with request_token
+            wait.until(
+                EC.url_contains("request_token") or EC.url_contains("status=success")
+            )
+            rt_url = driver.current_url
+
+            if "request_token=" in rt_url:
+                rt = rt_url.split("request_token=")[1].split("&")[0]
+            elif "request_token" in rt_url:
+                parts = rt_url.split("request_token")
+                if len(parts) > 1:
+                    rt = parts[1].lstrip("=&#?/")
+                else:
+                    raise Exception("Request token not found in URL; login failed?")
+            else:
+                raise Exception("Request token not found in URL; login failed?")
 
             data = self.kite.generate_session(rt, api_secret=self.config["api_secret"])
             self.access_token = data["access_token"]
+            self.kite.set_access_token(self.access_token)
+
+            logging.info("Login completed successfully.")
+
+            print("\n" + "=" * 70)
+            print("✅ LOGIN SUCCESSFUL!")
+            print("=" * 70)
+            print(f"Access Token: {self.access_token}")
+            print(f"User ID: {data.get('user_id', 'N/A')}")
+            print(f"User Name: {data.get('user_name', 'N/A')}")
+            print(f"Login Time: {data.get('login_time', 'N/A')}")
+            print("=" * 70 + "\n")
 
             return self.kite, self.access_token
 
+        except Exception as e:
+            logging.error(f"Login attempt failed: {e}")
+            raise
         finally:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 # -------------------------------------------------------------------------
 # MAIN
 # -------------------------------------------------------------------------
 
 def main():
-    client = ZerodhaClient()
-    _, access_token = client.login()
+    try:
+        client = ZerodhaClient(user_id="XW7136")
+        _, access_token = client.login()
 
-    save_token_to_mongo(access_token)
+        # Save token into MongoDB
+        save_token_to_mongo(access_token)
 
-    print(access_token)
+        # Last line: token (useful for logs/debug)
+        print(access_token)
+
+    except Exception as e:
+        logging.error(f"Error in main(): {e}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
-
