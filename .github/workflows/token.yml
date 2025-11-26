@@ -2,9 +2,9 @@ name: Refresh Zerodha Token
 
 on:
   schedule:
-    # 6:00 AM IST = 00:30 UTC
+    # Runs every day at 6:00 AM IST (00:30 UTC)
     - cron: "30 0 * * *"
-  workflow_dispatch: {}   # lets you trigger manually from UI
+  workflow_dispatch: {}   # lets you trigger manually from the GitHub UI
 
 jobs:
   refresh-token:
@@ -38,5 +38,6 @@ jobs:
           ZERODHA_TOTP_SECRET: ${{ secrets.ZERODHA_TOTP_SECRET }}
           MONGO_URI: ${{ secrets.MONGO_URI }}
           GITHUB_ACTIONS: "true"
+          CHROME_BIN: "/usr/bin/chromium-browser"
         run: |
           python final.py
